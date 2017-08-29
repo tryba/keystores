@@ -1,7 +1,9 @@
 require 'openssl'
+require 'digest'
 require 'securerandom'
 require 'keystores/jks/pkcs8_key'
 require 'keystores/jks/encrypted_private_key_info'
+require 'javaobs'
 
 # This is an implementation of a Sun proprietary, exportable algorithm
 # intended for use when protecting (or recovering the cleartext version of)
@@ -120,6 +122,70 @@ module Keystores
         Keystores::Jks::EncryptedPrivateKeyInfo.new(:algorithm => KEY_PROTECTOR_OID,
                                                     :encrypted_data => encr_key.pack('c*')).encoded
       end
+
+      def unseal(sealed_object)
+        raise ArgumentError.new("Unsupported algorithm used for encrypting SealedObject: #{sealed_object.seal_alg}") unless sealed_object.seal_alg == "PBEWithMD5AndTripleDES"
+        raise ArgumentError.new("Unexpected parameters algorithm used, shoudl match #{sealed_object.seal_alg} but found #{sealed_object.params_alg}") unless sealed_object.seal_alg == sealed_object.params_alg
+        raise ArgumentError.new("No parameters found in Sealed object for sealing algorithm. Need a salt and teration count to unseal.") unless !sealed_object.encoded_params.empty?
+
+        params = sealed_object.encoded_params.map {|b| b.chr}.join
+        decoded = OpenSSL::ASN1::decode(params)
+        salt = decoded.value[0].value
+        iteration_count = decoded.value[1].value.to_i
+
+        plaintext = jce_pbe_decrypt(sealed_object.encrypted_content, @passwd_bytes, salt, iteration_count)
+        stream = StringIO.new(plaintext)
+        object_input_stream = Java::ObjectInputStream.new(stream)
+        object_input_stream.readObject
+      end
+
+      def jce_pbe_decrypt(encrypted_content, password_bytes, salt, iteration_count)
+
+        key, iv = jce_pbe_key_and_iv(salt, iteration_count)
+
+        cipher = OpenSSL::Cipher::Cipher.new('des3')
+        cipher.encrypt
+        cipher.key = key
+        cipher.iv =  iv
+        cipher.decrypt
+        encrypted_string = encrypted_content.map {|b| b.chr}.join
+
+        plaintext = cipher.update(encrypted_string)
+        plaintext << cipher.final
+        return plaintext
+
+      end
+
+      def jce_pbe_key_and_iv(salt, iteration_count)
+        raise ArgumentError.new("Expected 8 byte salt, found {salt.length} bytes") if salt.length != 8
+
+        salt_halves = [salt[0..3], salt[4..8]]
+        salt_halves[0] = jce_invert_salt_half(salt_halves[0]) if salt_halves[0] == salt_halves[1]
+
+        derived = 2.times.map do |i|
+          to_be_hashed = salt_halves[i]
+          iteration_count.times do |j|
+            md5 = Digest::MD5.new
+            md5.update(to_be_hashed)
+            md5.update(@password)
+            to_be_hashed = md5.digest
+          end
+          to_be_hashed
+        end.join
+
+        key = derived[0..-9]
+        iv = derived[-8..-1]
+        return [key, iv]
+      end
+
+      def jce_invert_salt_half(salt_half)
+        bytes = salt_half.bytes
+        bytes[2] = bytes[1]
+        bytes[1] = bytes[0]
+        bytes[0] = bytes[3]
+        bytes.map {|b| b.chr}.join
+      end
+
 
       def recover(encrypted_private_key_info)
         unless encrypted_private_key_info.algorithm == KEY_PROTECTOR_OID

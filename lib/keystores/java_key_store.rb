@@ -4,6 +4,7 @@ require 'keystores/jks/encrypted_private_key_info'
 require 'thread'
 require 'openssl'
 require 'date'
+require 'javaobs'
 
 module Keystores
   # An implementation of a Java Key Store (JKS) Format
@@ -12,11 +13,13 @@ module Keystores
     TYPE = 'JKS'
 
     # Defined by JavaKeyStore.java
-    MAGIC = 0xfeedfeed
+    JCEKS_MAGIC = 0xcececece
+    JKS_MAGIC = 0xfeedfeed
     VERSION_1 = 0x01
     VERSION_2 = 0x02
     KEY_ENTRY_TAG = 1
     TRUSTED_CERTIFICATE_ENTRY_TAG = 2
+    SECRET_KEY_ENTRY_TAG = 3
 
     def initialize
       @entries = {}
@@ -75,7 +78,7 @@ module Keystores
 
       # This somewhat odd control flow mirrors the Java code for ease of porting
       # TODO clean this up
-      if entry.nil? || !entry.is_a?(KeyEntry)
+      if entry.nil?
         return nil
       end
 
@@ -83,9 +86,18 @@ module Keystores
         raise IOError.new('Password must not be nil')
       end
 
-      encrypted_private_key = entry.encrypted_private_key
-      encrypted_private_key_info = Keystores::Jks::EncryptedPrivateKeyInfo.new(:encoded => encrypted_private_key)
-      Keystores::Jks::KeyProtector.new(password).recover(encrypted_private_key_info)
+      key_protector = Keystores::Jks::KeyProtector.new(password)
+      case entry
+      when KeyEntry
+        encrypted_private_key = entry.encrypted_private_key
+        encrypted_private_key_info = Keystores::Jks::EncryptedPrivateKeyInfo.new(:encoded => encrypted_private_key)
+        key_protector.recover(encrypted_private_key_info)
+      when SecretKeyEntry
+        result = key_protector.unseal(entry.sealed_key)
+        result.key.map {|b| b.chr}.join
+      else
+        return nil
+      end
     end
 
     def get_type
@@ -109,7 +121,7 @@ module Keystores
         magic = read_int!(key_store_bytes, md)
         version = read_int!(key_store_bytes, md)
 
-        if magic != MAGIC || (version != VERSION_1 && version != VERSION_2)
+        if (magic != JKS_MAGIC && magic != JCEKS_MAGIC) || (version != VERSION_1 && version != VERSION_2)
           raise IOError.new('Invalid keystore format')
         end
 
@@ -117,7 +129,6 @@ module Keystores
 
         count.times do
           tag = read_int!(key_store_bytes, md)
-
           if tag == KEY_ENTRY_TAG
             key_entry = KeyEntry.new
             aliaz = read_utf!(key_store_bytes, md)
@@ -150,6 +161,14 @@ module Keystores
             certificate = read_certificate(key_store_bytes, version, md)
             trusted_cert_entry.certificate = certificate
             @entries[aliaz] = trusted_cert_entry
+          elsif tag == SECRET_KEY_ENTRY_TAG
+            secret_key_entry = SecretKeyEntry.new
+            aliaz = read_utf!(key_store_bytes, md)
+            time = read_long!(key_store_bytes, md)
+            secret_key_entry.creation_date = time
+            secret_key_entry.sealed_key, key_store_bytes = read_secret_key(key_store_bytes, md)
+            @entries[aliaz] = secret_key_entry
+
           else
             raise IOError.new('Unrecognized keystore entry')
           end
@@ -249,6 +268,15 @@ module Keystores
 
     private
 
+    def read_secret_key(key_store_bytes, md)
+      stream = StringIO.new(key_store_bytes)
+      object_input_stream = Java::ObjectInputStream.new(stream)
+      result = object_input_stream.readObject
+      remaining = stream.read
+      md << key_store_bytes[0..-(remaining.length + 1)]
+      [result,remaining]
+    end
+
     def read_certificate(key_store_bytes, version, md)
       # If we are a version 2 JKS, we check to see if we have the right certificate type
       # Version 1 JKS format unconditionally assumed X509
@@ -279,6 +307,7 @@ module Keystores
         passwd_bytes << (byte >> 8)
         passwd_bytes << byte
       end
+
       md << passwd_bytes.pack('c*')
       md << 'Mighty Aphrodite'.force_encoding('UTF-8')
       md
@@ -363,6 +392,9 @@ module Keystores
 
     class TrustedCertificateEntry
       attr_accessor :creation_date, :certificate
+    end
+    class SecretKeyEntry
+      attr_accessor :creation_date, :sealed_key
     end
   end
 end
