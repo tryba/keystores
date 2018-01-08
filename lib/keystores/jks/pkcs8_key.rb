@@ -60,10 +60,10 @@ module OpenSSL
     class RSA
       original_initialize = instance_method(:initialize)
 
-      define_method(:initialize) do |der_or_pem|
+      define_method(:initialize) do |der_or_pem, pass_phrase = nil|
         init = original_initialize.bind(self)
         begin
-          init.(der_or_pem)
+          init.(der_or_pem, pass_phrase)
         rescue Exception
           # If we blow up trying to parse the key, we might be der encoded PKCS8, and if we are, convert ourselves
           # to PEM and try again.
